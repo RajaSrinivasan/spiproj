@@ -4,7 +4,7 @@
 
 Ada firmware for the STM32F4 Discovery board (STM32F407VG). A microSD card
 reader and a BME280 weather sensor share SPI2. `weather_logger` also prints
-each sample on USART2. A bootloader in the first 384 KiB of flash looks for
+each sample on USART2. A bootloader in the first 64 KiB of flash looks for
 a file named `bootstrap` on that card and, when the file is a valid image,
 replaces the application. The sources use AdaCore's
 [Ada_Drivers_Library](https://github.com/AdaCore/Ada_Drivers_Library) and the
@@ -71,16 +71,13 @@ src/read_bme280_id.adb      main: chip-id check
 src/demo_spi2.adb           main: sensor read and SD block round-trip
 src/serial_log.ads/.adb     USART2 text log (115200 8N1, CR LF)
 src/flash_crc.ads/.adb      STM32 CRC-32 of .text, .rodata, and .data in flash
-src/stm32_crc.ads/.adb      that CRC, as a byte stream, for both programs
-src/flash_layout.ads/.adb   bootloader and application windows
-src/internal_flash.ads/.adb erase and program the application window
-src/bootstrap_image.ads/.adb  32-byte header and vector checks
-src/app_jump.ads/.adb       branch into the application
-src/bootloader.adb          main: SD bootstrap, then the application
+src/stm32_crc.ads/.adb      that CRC, as a byte stream, for the application
+src/boot/                    light-runtime bootloader (own FAT and SPI)
+bootloader.gpr              bootloader project (runtime light-stm32f4)
 src/weather_logger.adb      main: CSV log, USART2, and periodic CRC check
 ld/layout_symbols.ld        flash window addresses
-ld/boot_rom.ld              bootloader link (sectors 0-6)
-ld/app_rom.ld               application link (sectors 7-11)
+ld/boot_rom.ld              bootloader link (sectors 0-3)
+ld/app_rom.ld               application link (sectors 4-11)
 ld/sections.ld              SECTIONS block shared by both links
 ld/section_symbols.ld       linker symbols for the CRC ranges
 docs/stm32f4_spi_schematic.png
@@ -153,8 +150,8 @@ If the library is checked out somewhere else, edit that one line.
 
 From the repository root, with `gprbuild` and `arm-eabi-gcc` / `arm-eabi-gnat`
 on `PATH`. The runtime's own linker script pins all of flash at `0x08000000`,
-so every build passes `-XLOADER=USER` and supplies `ld/app_rom.ld` or
-`ld/boot_rom.ld` instead. `make` does both:
+so every build passes `-XLOADER=USER` and supplies its own linker script.
+`make` builds the application and the bootloader:
 
 ```sh
 make
@@ -163,15 +160,15 @@ make
 The same two steps without make:
 
 ```sh
-gprbuild -P spiproj.gpr -XLOADER=USER -XIMAGE=app
-gprbuild -P spiproj.gpr -XLOADER=USER -XIMAGE=boot
+gprbuild -P spiproj.gpr -XLOADER=USER
+gprbuild -P bootloader.gpr -XLOADER=USER
 ```
 
-`IMAGE=app` is the default. It builds `weather_logger`, `demo_spi2`, and
-`read_bme280_id`, linked at `0x08060000`. `IMAGE=boot` builds `bootloader`,
-linked at `0x08000000`. Object files go to `obj/app` or `obj/boot`. The ELF
-images go to `bin/` with those names and no extension. To build one
-application main:
+The application project builds `weather_logger`, `demo_spi2`, and
+`read_bme280_id`, linked at `0x08010000`, with the Ravenscar runtime.
+`bootloader.gpr` builds `bootloader` at `0x08000000` with the light
+runtime. Object files go to `obj/app` or `obj/boot`. The ELF images go to
+`bin/` with those names and no extension. To build one application main:
 
 ```sh
 gprbuild -P spiproj.gpr -XLOADER=USER weather_logger.adb
@@ -179,9 +176,11 @@ gprbuild -P spiproj.gpr -XLOADER=USER demo_spi2.adb
 gprbuild -P spiproj.gpr -XLOADER=USER read_bme280_id.adb
 ```
 
-The link passes `--gc-sections`. Unused library routines are dropped, which
-is what keeps the bootloader inside its 384 KiB window. The link fails if an
-image grows past the window in `ld/layout_symbols.ld`.
+The application link passes `--gc-sections`. The bootloader is a separate
+program: light runtime, `-Os`, no exception propagation, and a small FAT
+reader instead of Ada_Drivers_Library. That is what fits it in the 64 KiB
+window. The link fails if an image grows past the window in
+`ld/layout_symbols.ld`.
 
 ## CI
 
@@ -219,12 +218,12 @@ sector, so the two programs meet on a sector boundary.
 
 | Region       | Sectors | Address      | Size    |
 |--------------|---------|--------------|---------|
-| Bootloader   | 0 .. 6  | `0x08000000` | 384 KiB |
-| Application  | 7 .. 11 | `0x08060000` | 640 KiB |
+| Bootloader   | 0 .. 3  | `0x08000000` | 64 KiB  |
+| Application  | 4 .. 11 | `0x08010000` | 960 KiB |
 
 Sectors 0-3 are 16 KiB, sector 4 is 64 KiB, and sectors 5-11 are 128 KiB.
 The bootloader is linked at the reset address. Each application main is
-linked with its vector table at `0x08060000`. The runtime sets `VTOR` from
+linked with its vector table at `0x08010000`. The runtime sets `VTOR` from
 that table during its own startup; the bootloader also points `VTOR` there
 before the branch. The addresses are `ld/layout_symbols.ld`. The bootloader
 reads the same symbols, so a link and the program that consumes it cannot
@@ -239,7 +238,7 @@ bootloader with a blank application window logs `app_invalid` and waits.
 arm-eabi-objcopy -O binary bin/bootloader bin/bootloader.bin
 arm-eabi-objcopy -O binary bin/weather_logger bin/weather_logger.bin
 st-flash write bin/bootloader.bin 0x08000000
-st-flash --reset write bin/weather_logger.bin 0x08060000
+st-flash --reset write bin/weather_logger.bin 0x08010000
 ```
 
 ```sh
@@ -248,7 +247,7 @@ arm-eabi-objcopy -O binary bin/weather_logger bin/weather_logger.bin
 openocd -f board/stm32f4discovery.cfg \
   -c "init" \
   -c "program bin/bootloader.bin 0x08000000 verify" \
-  -c "program bin/weather_logger.bin 0x08060000 verify reset exit"
+  -c "program bin/weather_logger.bin 0x08010000 verify reset exit"
 ```
 
 OpenOCD can program the ELF files directly, at the addresses recorded in
@@ -273,10 +272,17 @@ has no virtual COM port.
 ## SD card bootstrap
 
 On reset the bootloader brings up USART2, then the SD card. The file it
-looks for is named `bootstrap`, with no extension, at the root of the FAT
-volume (the path is `/sd/bootstrap`). The name is nine letters, so the
-directory entry is a long file name. Copying it from Linux, macOS, or
-Windows onto a FAT12, FAT16, or FAT32 card creates that entry.
+looks for is named `bootstrap`, with no extension, in the root directory of
+the FAT volume (the logger would see that as `/sd/bootstrap`). The name is
+nine letters, so the directory entry is a long file name. Copying it from
+Linux, macOS, or Windows onto a FAT12, FAT16, or FAT32 card creates that
+entry.
+
+The bootloader is not the Ravenscar application. It is built with the light
+runtime from `bootloader.gpr`, compiled `-Os` with no exception propagation
+and no secondary stack, and it does not link Ada_Drivers_Library. SPI, the
+FAT reader, and the flash programmer in `src/boot` are only what this job
+needs. The application still uses the full library and the Ravenscar runtime.
 
 The file is a 32-byte little-endian header plus the raw application image
 from `arm-eabi-objcopy -O binary`. It is not an ELF. `tools/bootstrap_image.py`
@@ -288,7 +294,7 @@ writes the header. The payload CRC is the same STM32 CRC-32 as
 | 0      | 4    | ASCII `SPB1`                               |
 | 4      | 4    | header length, 32                          |
 | 8      | 4    | payload length                             |
-| 12     | 4    | load address, must be `0x08060000`         |
+| 12     | 4    | load address, must be `0x08010000`         |
 | 16     | 4    | STM32 CRC-32 of the payload                |
 | 20     | 4    | STM32 CRC-32 of bytes 0 .. 19              |
 | 24     | 8    | reserved, zero                             |
@@ -332,7 +338,7 @@ weather logger image.
 
 A missing card, a missing file, a bad header, a bad CRC, or a vector that
 does not look bootable: the file is left in place and the bootloader
-branches to the application if the two words at `0x08060000` look like a
+branches to the application if the two words at `0x08010000` look like a
 stack pointer and a Thumb reset handler. Nothing is erased.
 
 Erase, program, or verify failed: the old application may already be gone.
@@ -343,7 +349,7 @@ Delete failed after a good verify: the new image is already checked, so the
 bootloader still branches. The file is still on the card. The next reset
 takes the already-programmed path and retries the delete without erasing.
 
-Sectors 0-6 are never erased by this program.
+Sectors 0-3 are never erased by this program.
 
 ### Bootloader log and LEDs
 
@@ -359,22 +365,22 @@ No file:
 ```text
 sample:type:payload
 1:INFO:bootloader
-2:INFO:layout:boot:08000000:00060000:app:08060000:000A0000
+2:INFO:layout:boot:08000000:00010000:app:08010000:000F0000
 3:INFO:no_bootstrap
-4:INFO:jump_app:08060000
+4:INFO:jump_app:08010000
 ```
 
 A valid file that is not yet in flash:
 
 ```text
 1:INFO:bootloader
-2:INFO:layout:boot:08000000:00060000:app:08060000:000A0000
+2:INFO:layout:boot:08000000:00010000:app:08010000:000F0000
 3:INFO:bootstrap_ok:00039ADC:A1B2C3D4
 4:INFO:erase
 5:INFO:program
 6:INFO:verify_ok
 7:INFO:bootstrap_deleted
-8:INFO:jump_app:08060000
+8:INFO:jump_app:08010000
 ```
 
 `bootstrap_ok` is the payload length and the payload CRC, eight uppercase
@@ -476,17 +482,17 @@ uppercase hex digits. `status` is `REF` for the digest captured at boot,
 then `OK` or `MISMATCH` when that digest is computed again:
 
 ```text
-2:HASH:text:08060000:00055DC8:A1B2C3D4:REF
+2:HASH:text:08010000:00055DC8:A1B2C3D4:REF
 3:HASH:rodata:08065DC8:0000B460:11223344:REF
 4:HASH:data_lma:08071228:00000FB0:55667788:REF
-12:HASH:text:08060000:00055DC8:A1B2C3D4:OK
+12:HASH:text:08010000:00055DC8:A1B2C3D4:OK
 13:HASH:rodata:08065DC8:0000B460:11223344:MISMATCH
 14:ERR:crc_mismatch:rodata
 ```
 
 The addresses and the CRC in those examples are the shape of the line, not
 the values for a particular build. The application is linked at
-`0x08060000`, so `text` starts there. The bootloader, in the low 384 KiB, is
+`0x08010000`, so `text` starts there. The bootloader, in the low 64 KiB, is
 not part of this check. Compare a board's `REF` line with
 `tools/elf_hashes.py` (below). `text` is the `.text` output section
 (`__text_start` .. `__text_end`). `rodata` is `.rodata`
@@ -531,7 +537,7 @@ already up.
 ELF, without a sample number or a status:
 
 ```text
-HASH:text:08060000:00055DC8:A1B2C3D4
+HASH:text:08010000:00055DC8:A1B2C3D4
 HASH:rodata:08065DC8:0000B460:11223344
 HASH:data_lma:08071228:00000FB0:55667788
 ```
@@ -588,7 +594,7 @@ The `embedded-stm32f4` runtime includes `Ada.Text_IO` and does not include
   provide a serial port.
 - The flash CRC is the STM32 CRC unit, not a cryptographic hash. It covers
   the application's `.text`, `.rodata`, and the flash bytes loaded into
-  `.data`, which now start at `0x08060000`. It does not cover the
+  `.data`, which now start at `0x08010000`. It does not cover the
   bootloader, `.bss`, or the ARM exception-index sections. The reference is
   taken at boot from the flash that is already programmed; the firmware does
   not store the `elf_hashes.py` digest. Compare the `REF` line to the CI text
@@ -606,6 +612,13 @@ The `embedded-stm32f4` runtime includes `Ada.Text_IO` and does not include
 - Replacing the bootloader is a probe write. The SD path only rewrites
   sectors inside the application window, and only the ones the payload
   overlaps. Stores are 32-bit, which assumes the Discovery's 3.3 V supply.
+- The bootloader FAT reader understands FAT12, FAT16, and FAT32 in the root
+  directory, including a long name. It marks the directory entry deleted and
+  frees the cluster chain in both FAT copies. It does not rewrite the FAT32
+  FSInfo free-count hint. It has no tasking and no exception propagation, so
+  a fault there does not print `ERR:exception`; the light runtime stops in
+  its default handler. The validate / erase / verify / delete order is the
+  same as before.
 - `demo_spi2` temporarily overwrites the card's last block. It restores that
   block when the test finishes, and it does not write block 0. A power loss
   in the middle of the test can leave the last block overwritten.

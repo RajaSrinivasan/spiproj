@@ -90,8 +90,8 @@ jobs:
           # LOADER=USER suppresses the runtime script that pins flash at
           # 0x08000000. The application and the bootloader are linked
           # separately so each gets its own window.
-          gprbuild -P spiproj.gpr -XLOADER=USER -XIMAGE=app -j"$(nproc)"
-          gprbuild -P spiproj.gpr -XLOADER=USER -XIMAGE=boot -j"$(nproc)"
+          gprbuild -P spiproj.gpr -XLOADER=USER -j"$(nproc)"
+          gprbuild -P bootloader.gpr -XLOADER=USER -j"$(nproc)"
 
       - name: Package ELF and BIN images
         run: |

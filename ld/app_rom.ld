@@ -1,4 +1,4 @@
-/* Application window: sectors 7-11. The vector table is at __app_origin.
+/* Application window: sectors 4-11. The vector table is at __app_origin.
    The bootloader sets MSP and VTOR from that table and branches to the
    reset handler. Include this instead of the runtime common-ROM.ld
    (gprbuild -XLOADER=USER). */
