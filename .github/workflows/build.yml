@@ -101,6 +101,14 @@ jobs:
           done
           ls -l artifacts
 
+      - name: STM32 CRC-32 of the flash images
+        run: |
+          set -euo pipefail
+          python3 tools/elf_hashes.py --self-test
+          for name in weather_logger demo_spi2 read_bme280_id; do
+            python3 tools/elf_hashes.py "bin/${name}" | tee "artifacts/${name}.crc32.txt"
+          done
+
       - name: Upload images
         uses: actions/upload-artifact@v4
         with:

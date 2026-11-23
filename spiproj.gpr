@@ -31,4 +31,12 @@ project Spiproj is
    for Main use ("weather_logger.adb", "demo_spi2.adb", "read_bme280_id.adb");
 
    package Compiler renames STM32F407_Discovery_Full.Compiler;
+
+   package Linker is
+      --  obj/ is the link cwd, so the script path is relative to that.
+      --  gprbuild puts this -T before the runtime's -T common-ROM.ld.
+      --  GNU ld still resolves ADDR, SIZEOF, and LOADADDR from that script.
+      for Default_Switches ("Ada") use
+        ("-Wl,-T,../ld/section_symbols.ld");
+   end Linker;
 end Spiproj;

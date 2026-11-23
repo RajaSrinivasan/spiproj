@@ -67,9 +67,12 @@ src/bme280.ads/.adb         BME280 driver (temperature, pressure, humidity)
 src/read_bme280_id.adb      main: chip-id check
 src/demo_spi2.adb           main: sensor read and SD block round-trip
 src/serial_log.ads/.adb     USART2 text log (115200 8N1, CR LF)
-src/weather_logger.adb      main: CSV log on the card and USART2 every 10 s
+src/flash_crc.ads/.adb      STM32 CRC-32 of .text, .rodata, and .data in flash
+src/weather_logger.adb      main: CSV log, USART2, and periodic CRC check
+ld/section_symbols.ld       linker symbols for those flash ranges
 docs/stm32f4_spi_schematic.png
 tools/draw.py
+tools/elf_hashes.py         same CRC-32, computed from an ELF file
 lib/Ada_Drivers_Library/    git submodule
 ```
 
@@ -90,6 +93,12 @@ lib/Ada_Drivers_Library/    git submodule
 - `Serial_Log` brings up USART2 on PA2 (TX) and PA3 (RX) at 115200 8N1 and
   provides `Put` and `Put_Line`. `Put_Line` appends CR LF. It uses
   `STM32.USARTs` and `STM32.Device` (`USART_2`, `GPIO_AF_USART2_7`).
+- `Flash_CRC` hashes three flash images with the STM32F4 CRC unit
+  (`STM32.CRC` / `CRC_Unit`): `.text`, `.rodata`, and the load image of
+  `.data`. The bounds are the linker symbols in `ld/section_symbols.ld`
+  (`__text_start` / `__text_end`, `__rodata_start` / `__rodata_end`,
+  `__data_lma_start` / `__data_lma_end`). This is a corruption check. It is
+  not a cryptographic hash.
 - `BME280` is a standalone driver. Ada_Drivers_Library ships `BMP280` only,
   and that package does not implement humidity and only checks that the
   chip-id is non-zero. This driver requires chip-id `16#60#`, reads the
@@ -154,7 +163,11 @@ checks out `lib/Ada_Drivers_Library` with its submodules, and runs
 artifact: `weather_logger.elf` and `.bin`, `demo_spi2.elf` and `.bin`, and
 `read_bme280_id.elf` and `.bin`. The `.elf` files are the extensionless
 `bin/` programs with a suffix added. The `.bin` files come from
-`arm-eabi-objcopy -O binary`.
+`arm-eabi-objcopy -O binary`. After the link, the job runs
+`tools/elf_hashes.py` on each ELF and uploads `weather_logger.crc32.txt`,
+`demo_spi2.crc32.txt`, and `read_bme280_id.crc32.txt` in the same artifact.
+Those lines are the STM32 CRC-32 a board should print as `REF` for that
+image. The script's `--self-test` checks a known CRC word first.
 
 ## Flash
 
@@ -229,35 +242,101 @@ converted to pascals for the `pressure_pa` column.
 USART2, 115200 baud, 8 data bits, no parity, 1 stop bit, no flow control.
 TX is PA2, RX is PA3, alternate function AF7. Each line ends with CR LF.
 
-At startup the firmware prints one header line naming the fields. Each sample
-then prints one colon-separated line. The first field is a sample number that
-starts at 1 and increases by one for every sample, including samples taken
-while the SD card is absent. The remaining fields are the CSV columns, in the
-same order and with the same formatting (elapsed seconds, temperature in °C
-with two decimal places, pressure in pascals, humidity in percent with two
-decimal places):
+At startup the firmware prints one header line, which is not a sample:
 
 ```text
-sample:seconds:temp_c:pressure_pa:humidity_pct
-1:0:23.45:101325:48.20
-2:10:23.47:101318:48.31
+sample:type:payload
 ```
 
-`1:0:23.45:101325:48.20` is sample 1, zero seconds since the logging loop
-started, 23.45 °C, 101325 Pa (1013.25 hPa), 48.20 % relative humidity.
+Every later line shares one counter. It starts at 1 and increases by one for
+each `DATA`, `HASH`, `ERR`, and `INFO` line, including lines printed while
+the SD card is absent. The counter is not a count of weather samples alone:
+a hash line or an error line consumes a number too. It starts again at 1
+after a reset.
+
+The `type` field is one of `DATA`, `HASH`, `ERR`, or `INFO`.
+
+`DATA` carries the CSV columns, in the same order and with the same
+formatting (elapsed seconds, temperature in °C with two decimal places,
+pressure in pascals, humidity in percent with two decimal places):
+
+```text
+6:DATA:0:23.45:101325:48.20
+7:DATA:10:23.47:101318:48.31
+```
+
+`6:DATA:0:23.45:101325:48.20` is log line 6, zero seconds since the logging
+loop started, 23.45 °C, 101325 Pa (1013.25 hPa), 48.20 % relative humidity.
+The number 6 is only an example: boot lines (the info line and the three
+reference hashes, and any SD error) come first, so the first `DATA` line is
+not sample 1.
+
+`HASH` is one flash segment. `start_hex`, `length`, and `hash_hex` are eight
+uppercase hex digits. `status` is `REF` for the digest captured at boot,
+then `OK` or `MISMATCH` when that digest is computed again:
+
+```text
+2:HASH:text:08000000:00055DC8:A1B2C3D4:REF
+3:HASH:rodata:0805DAB0:0000B460:11223344:REF
+4:HASH:data_lma:08068F10:00000FB0:55667788:REF
+12:HASH:text:08000000:00055DC8:A1B2C3D4:OK
+13:HASH:rodata:0805DAB0:0000B460:11223344:MISMATCH
+14:ERR:crc_mismatch:rodata
+```
+
+The addresses and the CRC in those examples are the shape of the line, not
+the values for a particular build. Compare a board's `REF` line with
+`tools/elf_hashes.py` (below). `text` is the `.text` output section
+(`__text_start` .. `__text_end`). `rodata` is `.rodata`
+(`__rodata_start` .. `__rodata_end`). `data_lma` is the flash load image of
+initialized `.data` (`__data_lma_start` .. `__data_lma_end` from
+`LOADADDR(.data)`), not the RAM copy. `.bss`, `.ARM.extab`, and `.ARM.exidx`
+are not covered.
+
+The CRC is the STM32F4 hardware unit (`STM32.CRC`): polynomial `0x04C11DB7`,
+initial value `0xFFFFFFFF`, no input or output reflection, no final XOR.
+Each word is a little-endian load. A 1..3 byte tail, if a section is not a
+multiple of four bytes, is packed into the low bytes of a zero-padded word.
+`tools/elf_hashes.py` implements that same function. It detects corruption.
+It is not a cryptographic hash.
+
+Boot prints one `INFO` line with the recheck period, then the three `REF`
+lines. `Check_Period_Seconds` in `src/flash_crc.ads` is 60. The main loop
+recomputes all three segments when that period has elapsed, in the gap
+before the next 10 s `delay until`, so the weather sample stays on its
+10 s marks. A mismatch prints `ERR:crc_mismatch:<segment>` and turns the
+red LED on. The LED stays on after that.
+
+```text
+1:INFO:crc_period_s:60
+```
 
 If the card fails to initialize or the volume fails to mount, the firmware
 prints an error line and keeps sampling on the serial port instead of
 halting:
 
 ```text
-error:sd_init_failed
-error:sd_mount_failed
+5:ERR:sd_init_failed
+5:ERR:sd_mount_failed
 ```
 
-A later failed append prints `error:sd_write_failed` and the next samples
-are still printed. A missing BME280 prints `error:bme280_init_failed` and
-then stops; there is nothing to log without the sensor.
+A later failed append prints `ERR:sd_write_failed` and the next samples are
+still printed. A missing BME280 prints `ERR:bme280_init_failed` and then
+stops. An unexpected exception prints `ERR:exception` when the USART is
+already up.
+
+`tools/elf_hashes.py bin/weather_logger` prints the three digests for that
+ELF, without a sample number or a status:
+
+```text
+HASH:text:08000000:00055DC8:A1B2C3D4
+HASH:rodata:0805DAB0:0000B460:11223344
+HASH:data_lma:08068F10:00000FB0:55667788
+```
+
+The `text` / `rodata` / `data_lma`, start, length, and CRC fields are the
+same fields as the board's `REF` line. CI runs this on every image and
+uploads the text next to the ELF.
 
 View the log from a 3.3 V USB-UART adapter (device name varies):
 
@@ -272,13 +351,15 @@ picocom -b 115200 /dev/ttyUSB0
 Leave `screen` with `Ctrl-A` then `K`. Leave `picocom` with `Ctrl-A` then
 `Ctrl-X`.
 
-- Green LED: a short blink after each successful SD write.
+- Green LED: a short blink after each successful SD write. It still blinks
+  if a CRC mismatch has already latched the red LED.
 - Red LED, solid: the card failed to initialize, the volume failed to mount,
   or a write failed. Serial samples continue. A successful later write turns
-  the red LED off.
+  the red LED off, unless a CRC mismatch has already been reported.
+- Red LED, solid, after `ERR:crc_mismatch`: a segment no longer matches the
+  boot digest. Serial logging continues and the red LED stays on.
 - Red LED, solid, program stopped: the BME280 did not answer, or an
-  unexpected exception was raised (`error:exception` on the serial port when
-  the USART is already up).
+  unexpected exception was raised.
 
 `File_IO` has no append mode, and opening a file `Write_Only` truncates it.
 The logger opens `Read_Write` (which creates the file when it is missing),
@@ -299,10 +380,17 @@ The `embedded-stm32f4` runtime includes `Ada.Text_IO` and does not include
   MBR or as a superfloppy. The logger does not format a blank card.
 - The `seconds` column is time since boot (elapsed seconds from the start of
   the logging loop), not wall-clock time. The serial sample number starts
-  again at 1 on every reset.
+  again at 1 on every reset and is shared by every line type.
 - The serial log uses the same hand-written integer formatting as the CSV.
   Connect only a 3.3 V USB-UART adapter. The Discovery ST-LINK does not
   provide a serial port.
+- The flash CRC is the STM32 CRC unit, not a cryptographic hash. It covers
+  `.text`, `.rodata`, and the flash bytes loaded into `.data`. It does not
+  cover `.bss` or the ARM exception-index sections. The reference is taken
+  at boot from the flash that is already programmed; the firmware does not
+  store the `elf_hashes.py` digest. Compare the `REF` line to the CI text
+  file for that image yourself. A mismatch means flash changed after boot,
+  or the boot digest and a later read disagree.
 - `demo_spi2` temporarily overwrites the card's last block. It restores that
   block when the test finishes, and it does not write block 0. A power loss
   in the middle of the test can leave the last block overwritten.

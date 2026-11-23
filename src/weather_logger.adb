@@ -20,15 +20,18 @@
 --  (a-textio) but not Ada.Text_IO.Float_IO / Integer_IO (no a-tiflio or
 --  a-tiinio in the runtime). The same helpers format the USART2 line.
 --
---  Every sample is also written to USART2 (PA2 TX, PA3 RX, 115200 8N1)
---  as a colon-separated line with a CR LF ending. The first field is a
---  sample number starting at 1. The rest match the CSV columns.
+--  Every reading is also written to USART2 (PA2 TX, PA3 RX, 115200 8N1).
+--  Lines are colon-separated and end with CR LF. One sample counter,
+--  starting at 1, is shared by DATA, HASH, ERR, and INFO lines. The header
+--  that names the columns is not counted. DATA lines carry the CSV columns.
+--  HASH lines are the STM32 CRC-32 of .text, .rodata, and the .data flash
+--  image (see Flash_CRC). A mismatch also prints ERR and latches the red LED.
 --
 --  Green LED blinks after each successful SD write. A solid red LED means
---  the card failed to initialize, the volume failed to mount, or a write
---  failed. Serial logging continues in those cases. A missing or unread
---  BME280 is still fatal: the red LED stays on and the program stops,
---  after an error line on the serial port.
+--  the card failed to initialize, the volume failed to mount, a write
+--  failed, or a flash CRC no longer matches the boot reference. Serial
+--  logging continues in those cases. The red LED stays on after a CRC
+--  mismatch. A missing or unread BME280 is still fatal.
 ------------------------------------------------------------------------------
 
 with Ada.Real_Time; use Ada.Real_Time;
@@ -41,12 +44,15 @@ with Filesystem;      use Filesystem;
 with Filesystem.FAT;
 with Filesystem.MBR;  use Filesystem.MBR;
 
+with HAL; use HAL;
+
 with STM32.Board; use STM32.Board;
 
 with SPI_Bus;
 with BME280; use BME280;
 with SD_SPI; use SD_SPI;
 with Serial_Log;
+with Flash_CRC;
 
 procedure Weather_Logger is
 
@@ -54,8 +60,12 @@ procedure Weather_Logger is
      "seconds,temp_c,pressure_pa,humidity_pct" & ASCII.LF;
    Path   : constant String := "/sd/WEATHER.CSV";
 
-   Serial_Header : constant String :=
-     "sample:seconds:temp_c:pressure_pa:humidity_pct";
+   Serial_Header : constant String := "sample:type:payload";
+
+   --  Shared by every DATA, HASH, ERR, and INFO line. The header is not
+   --  a sample. CRC_Fault latches so a later SD write cannot clear the LED.
+   Sample    : Natural := 0;
+   CRC_Fault : Boolean := False;
 
    procedure Fail with No_Return;
    --  Solid red LED, then wait forever.
@@ -97,13 +107,29 @@ procedure Weather_Logger is
       P       : Pressure;
       H       : Humidity) return Boolean;
 
+   procedure Emit (Kind : String; Rest : String);
+   --  One USART line: sample:Kind:Rest. Increments the shared counter.
+
    procedure Emit_Sample
-     (Sample  : Natural;
-      Seconds : Integer;
+     (Seconds : Integer;
       T       : Temperature;
       P       : Pressure;
       H       : Humidity);
-   --  One USART line. Same fixed-point scaling as the CSV row.
+   --  DATA line. Same fixed-point scaling as the CSV row.
+
+   procedure Append_Hex
+     (Buf   : in out String;
+      Last  : in out Natural;
+      Value : UInt32);
+   --  Eight uppercase hex digits.
+
+   procedure Emit_Hash
+     (Id     : Flash_CRC.Segment_Id;
+      Item   : Flash_CRC.Digest;
+      Status : String);
+
+   procedure Log_References;
+   procedure Log_Recheck;
 
    ----------
    -- Fail --
@@ -340,13 +366,29 @@ procedure Weather_Logger is
       return True;
    end Append_Reading;
 
+   ----------
+   -- Emit --
+   ----------
+
+   procedure Emit (Kind : String; Rest : String) is
+      Buf  : String (1 .. 128);
+      Last : Natural := 0;
+   begin
+      Sample := Sample + 1;
+      Append_Unsigned (Buf, Last, Sample);
+      Append (Buf, Last, ":");
+      Append (Buf, Last, Kind);
+      Append (Buf, Last, ":");
+      Append (Buf, Last, Rest);
+      Serial_Log.Put_Line (Buf (1 .. Last));
+   end Emit;
+
    -----------------
    -- Emit_Sample --
    -----------------
 
    procedure Emit_Sample
-     (Sample  : Natural;
-      Seconds : Integer;
+     (Seconds : Integer;
       T       : Temperature;
       P       : Pressure;
       H       : Humidity)
@@ -358,8 +400,6 @@ procedure Weather_Logger is
       T_100 : constant Integer := Integer (T / 0.01);
       H_100 : constant Integer := Integer (H / 0.01);
    begin
-      Append_Unsigned (Buf, Last, Sample);
-      Append (Buf, Last, ":");
       Append_Integer (Buf, Last, Seconds);
       Append (Buf, Last, ":");
       Append_Fixed_2 (Buf, Last, T_100);
@@ -367,8 +407,93 @@ procedure Weather_Logger is
       Append_Integer (Buf, Last, Pa);
       Append (Buf, Last, ":");
       Append_Fixed_2 (Buf, Last, H_100);
-      Serial_Log.Put_Line (Buf (1 .. Last));
+      Emit ("DATA", Buf (1 .. Last));
    end Emit_Sample;
+
+   ----------------
+   -- Append_Hex --
+   ----------------
+
+   procedure Append_Hex
+     (Buf   : in out String;
+      Last  : in out Natural;
+      Value : UInt32)
+   is
+      Hex_Digits : constant String := "0123456789ABCDEF";
+      V          : UInt32 := Value;
+      Stack      : String (1 .. 8);
+   begin
+      for I in reverse Stack'Range loop
+         Stack (I) := Hex_Digits (Hex_Digits'First + Natural (V mod 16));
+         V := V / 16;
+      end loop;
+      Append (Buf, Last, Stack);
+   end Append_Hex;
+
+   ---------------
+   -- Emit_Hash --
+   ---------------
+
+   procedure Emit_Hash
+     (Id     : Flash_CRC.Segment_Id;
+      Item   : Flash_CRC.Digest;
+      Status : String)
+   is
+      Buf  : String (1 .. 80);
+      Last : Natural := 0;
+   begin
+      Append (Buf, Last, Flash_CRC.Segment_Image (Id));
+      Append (Buf, Last, ":");
+      Append_Hex (Buf, Last, Item.Start);
+      Append (Buf, Last, ":");
+      Append_Hex (Buf, Last, Item.Length);
+      Append (Buf, Last, ":");
+      Append_Hex (Buf, Last, Item.CRC);
+      Append (Buf, Last, ":");
+      Append (Buf, Last, Status);
+      Emit ("HASH", Buf (1 .. Last));
+   end Emit_Hash;
+
+   ---------------------
+   -- Log_References --
+   ---------------------
+
+   procedure Log_References is
+      Buf  : String (1 .. 32);
+      Last : Natural := 0;
+   begin
+      Append (Buf, Last, "crc_period_s:");
+      Append_Unsigned (Buf, Last, Flash_CRC.Check_Period_Seconds);
+      Emit ("INFO", Buf (1 .. Last));
+      for Id in Flash_CRC.Segment_Id loop
+         Emit_Hash (Id, Flash_CRC.Reference (Id), "REF");
+      end loop;
+   end Log_References;
+
+   -----------------
+   -- Log_Recheck --
+   -----------------
+
+   procedure Log_Recheck is
+      Current : Flash_CRC.Digest;
+      Match   : Boolean;
+   begin
+      --  One pass over the three segments, between samples. Each segment
+      --  is a straight word walk of flash into the CRC unit, short next
+      --  to the 10 s sample period, so the delay-until below still hits
+      --  the original Next deadline.
+      for Id in Flash_CRC.Segment_Id loop
+         Flash_CRC.Recheck (Id, Current, Match);
+         if Match then
+            Emit_Hash (Id, Current, "OK");
+         else
+            CRC_Fault := True;
+            Turn_On (Red_LED);
+            Emit_Hash (Id, Current, "MISMATCH");
+            Emit ("ERR", "crc_mismatch:" & Flash_CRC.Segment_Image (Id));
+         end if;
+      end loop;
+   end Log_Recheck;
 
    Sensor    : BME280_Sensor;
    Card      : aliased SD_Card;
@@ -381,8 +506,8 @@ procedure Weather_Logger is
    H         : Humidity;
    Start     : Time;
    Next      : Time;
+   Next_Hash : Time;
    Elapsed   : Integer;
-   Sample    : Natural := 0;
    SD_Ready  : Boolean := False;
 
 begin
@@ -390,12 +515,14 @@ begin
    All_LEDs_Off;
    Serial_Log.Initialize;
    Serial_Log.Put_Line (Serial_Header);
+   Flash_CRC.Capture_References;
+   Log_References;
 
    SPI_Bus.Initialize;
 
    Initialize (Sensor, BME_Error);
    if BME_Error or else Get_Chip_ID (Sensor) /= Chip_ID (Expected_Chip_ID) then
-      Serial_Log.Put_Line ("error:bme280_init_failed");
+      Emit ("ERR", "bme280_init_failed");
       Fail;
    end if;
 
@@ -409,20 +536,21 @@ begin
 
    Initialize (Card, SD_Status);
    if SD_Status /= OK then
-      Serial_Log.Put_Line ("error:sd_init_failed");
+      Emit ("ERR", "sd_init_failed");
       Turn_On (Red_LED);
    else
       Status := Mount_Card (Card'Unchecked_Access, FAT_FS);
       if Status /= OK then
-         Serial_Log.Put_Line ("error:sd_mount_failed");
+         Emit ("ERR", "sd_mount_failed");
          Turn_On (Red_LED);
       else
          SD_Ready := True;
       end if;
    end if;
 
-   Start := Clock;
-   Next  := Start;
+   Start     := Clock;
+   Next      := Start;
+   Next_Hash := Start + Seconds (Flash_CRC.Check_Period_Seconds);
 
    loop
       T := Get_Temperature (Sensor);
@@ -430,20 +558,26 @@ begin
       H := Get_Humidity (Sensor);
 
       Elapsed := Integer ((Clock - Start) / Seconds (1));
-      Sample  := Sample + 1;
 
-      Emit_Sample (Sample, Elapsed, T, P, H);
+      Emit_Sample (Elapsed, T, P, H);
 
       if SD_Ready then
          if Append_Reading (Elapsed, T, P, H) then
-            Turn_Off (Red_LED);
+            if not CRC_Fault then
+               Turn_Off (Red_LED);
+            end if;
             Turn_On (Green_LED);
             delay until Clock + Milliseconds (80);
             Turn_Off (Green_LED);
          else
-            Serial_Log.Put_Line ("error:sd_write_failed");
+            Emit ("ERR", "sd_write_failed");
             Turn_On (Red_LED);
          end if;
+      end if;
+
+      if Clock >= Next_Hash then
+         Log_Recheck;
+         Next_Hash := Next_Hash + Seconds (Flash_CRC.Check_Period_Seconds);
       end if;
 
       Next := Next + Seconds (10);
@@ -452,7 +586,7 @@ begin
 
 exception
    when others =>
-      Serial_Log.Put_Line ("error:exception");
+      Emit ("ERR", "exception");
       All_LEDs_Off;
       Turn_On (Red_LED);
       loop
