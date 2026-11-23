@@ -18,10 +18,17 @@
 --
 --  Numbers are formatted by hand: embedded-stm32f4 ships Ada.Text_IO
 --  (a-textio) but not Ada.Text_IO.Float_IO / Integer_IO (no a-tiflio or
---  a-tiinio in the runtime).
+--  a-tiinio in the runtime). The same helpers format the USART2 line.
 --
---  Green LED blinks after each successful write. Solid red means a mount
---  or write failure (logging stops).
+--  Every sample is also written to USART2 (PA2 TX, PA3 RX, 115200 8N1)
+--  as a colon-separated line with a CR LF ending. The first field is a
+--  sample number starting at 1. The rest match the CSV columns.
+--
+--  Green LED blinks after each successful SD write. A solid red LED means
+--  the card failed to initialize, the volume failed to mount, or a write
+--  failed. Serial logging continues in those cases. A missing or unread
+--  BME280 is still fatal: the red LED stays on and the program stops,
+--  after an error line on the serial port.
 ------------------------------------------------------------------------------
 
 with Ada.Real_Time; use Ada.Real_Time;
@@ -39,12 +46,16 @@ with STM32.Board; use STM32.Board;
 with SPI_Bus;
 with BME280; use BME280;
 with SD_SPI; use SD_SPI;
+with Serial_Log;
 
 procedure Weather_Logger is
 
    Header : constant String :=
      "seconds,temp_c,pressure_pa,humidity_pct" & ASCII.LF;
    Path   : constant String := "/sd/WEATHER.CSV";
+
+   Serial_Header : constant String :=
+     "sample:seconds:temp_c:pressure_pa:humidity_pct";
 
    procedure Fail with No_Return;
    --  Solid red LED, then wait forever.
@@ -85,6 +96,14 @@ procedure Weather_Logger is
       T       : Temperature;
       P       : Pressure;
       H       : Humidity) return Boolean;
+
+   procedure Emit_Sample
+     (Sample  : Natural;
+      Seconds : Integer;
+      T       : Temperature;
+      P       : Pressure;
+      H       : Humidity);
+   --  One USART line. Same fixed-point scaling as the CSV row.
 
    ----------
    -- Fail --
@@ -321,6 +340,36 @@ procedure Weather_Logger is
       return True;
    end Append_Reading;
 
+   -----------------
+   -- Emit_Sample --
+   -----------------
+
+   procedure Emit_Sample
+     (Sample  : Natural;
+      Seconds : Integer;
+      T       : Temperature;
+      P       : Pressure;
+      H       : Humidity)
+   is
+      Buf   : String (1 .. 80);
+      Last  : Natural := 0;
+      --  Pressure is stored in hPa; the log column is pascals, as in the CSV.
+      Pa    : constant Integer := Integer (P * 100.0);
+      T_100 : constant Integer := Integer (T / 0.01);
+      H_100 : constant Integer := Integer (H / 0.01);
+   begin
+      Append_Unsigned (Buf, Last, Sample);
+      Append (Buf, Last, ":");
+      Append_Integer (Buf, Last, Seconds);
+      Append (Buf, Last, ":");
+      Append_Fixed_2 (Buf, Last, T_100);
+      Append (Buf, Last, ":");
+      Append_Integer (Buf, Last, Pa);
+      Append (Buf, Last, ":");
+      Append_Fixed_2 (Buf, Last, H_100);
+      Serial_Log.Put_Line (Buf (1 .. Last));
+   end Emit_Sample;
+
    Sensor    : BME280_Sensor;
    Card      : aliased SD_Card;
    FAT_FS    : aliased Filesystem.FAT.FAT_Filesystem;
@@ -333,14 +382,20 @@ procedure Weather_Logger is
    Start     : Time;
    Next      : Time;
    Elapsed   : Integer;
+   Sample    : Natural := 0;
+   SD_Ready  : Boolean := False;
 
 begin
    Initialize_LEDs;
    All_LEDs_Off;
+   Serial_Log.Initialize;
+   Serial_Log.Put_Line (Serial_Header);
+
    SPI_Bus.Initialize;
 
    Initialize (Sensor, BME_Error);
    if BME_Error or else Get_Chip_ID (Sensor) /= Chip_ID (Expected_Chip_ID) then
+      Serial_Log.Put_Line ("error:bme280_init_failed");
       Fail;
    end if;
 
@@ -354,12 +409,16 @@ begin
 
    Initialize (Card, SD_Status);
    if SD_Status /= OK then
-      Fail;
-   end if;
-
-   Status := Mount_Card (Card'Unchecked_Access, FAT_FS);
-   if Status /= OK then
-      Fail;
+      Serial_Log.Put_Line ("error:sd_init_failed");
+      Turn_On (Red_LED);
+   else
+      Status := Mount_Card (Card'Unchecked_Access, FAT_FS);
+      if Status /= OK then
+         Serial_Log.Put_Line ("error:sd_mount_failed");
+         Turn_On (Red_LED);
+      else
+         SD_Ready := True;
+      end if;
    end if;
 
    Start := Clock;
@@ -371,14 +430,21 @@ begin
       H := Get_Humidity (Sensor);
 
       Elapsed := Integer ((Clock - Start) / Seconds (1));
+      Sample  := Sample + 1;
 
-      if not Append_Reading (Elapsed, T, P, H) then
-         Fail;
+      Emit_Sample (Sample, Elapsed, T, P, H);
+
+      if SD_Ready then
+         if Append_Reading (Elapsed, T, P, H) then
+            Turn_Off (Red_LED);
+            Turn_On (Green_LED);
+            delay until Clock + Milliseconds (80);
+            Turn_Off (Green_LED);
+         else
+            Serial_Log.Put_Line ("error:sd_write_failed");
+            Turn_On (Red_LED);
+         end if;
       end if;
-
-      Turn_On (Green_LED);
-      delay until Clock + Milliseconds (80);
-      Turn_Off (Green_LED);
 
       Next := Next + Seconds (10);
       delay until Next;
@@ -386,6 +452,7 @@ begin
 
 exception
    when others =>
+      Serial_Log.Put_Line ("error:exception");
       All_LEDs_Off;
       Turn_On (Red_LED);
       loop

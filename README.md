@@ -3,7 +3,8 @@
 [![build](https://github.com/RajaSrinivasan/spiproj/actions/workflows/build.yml/badge.svg)](https://github.com/RajaSrinivasan/spiproj/actions/workflows/build.yml)
 
 Ada firmware for the STM32F4 Discovery board (STM32F407VG). A microSD card
-reader and a BME280 weather sensor share SPI2. The sources use AdaCore's
+reader and a BME280 weather sensor share SPI2. `weather_logger` also prints
+each sample on USART2. The sources use AdaCore's
 [Ada_Drivers_Library](https://github.com/AdaCore/Ada_Drivers_Library) and the
 `embedded-stm32f4` GNAT ARM ELF runtime.
 
@@ -20,10 +21,24 @@ Each has its own chip-select, held high when idle.
 | SPI2 MOSI  | PB15 | Alternate function AF5                             |
 | microSD CS | PB12 | Push-pull GPIO output, idle high                   |
 | BME280 CS  | PB11 | Push-pull GPIO output, idle high                   |
+| USART2 TX  | PA2  | Alternate function AF7 (`GPIO_AF_USART2_7`)        |
+| USART2 RX  | PA3  | Alternate function AF7                             |
+| GND        | GND  | Common ground with the USB-UART adapter            |
 
 Power both breakouts from 3.3 V and GND. Put 10 kΩ pull-ups to 3.3 V on both
 chip-selects and on MISO. Use a 3.3 V microSD breakout, or a 5 V breakout that
 has its own regulator and level shifter.
+
+Connect a 3.3 V USB-UART adapter for the serial log: adapter RX to PA2
+(USART2_TX), adapter TX to PA3 (USART2_RX), and adapter GND to board GND.
+The STM32F407 pins are not 5 V tolerant. Do not use a 5 V USB-UART adapter.
+
+PA2 and PA3 are free on the Discovery. The user button is PA0, the LEDs are
+PD12–PD15, the LIS3DSH uses SPI1 (PA5, PA6, PA7, PE3), the audio codec uses
+PA4, PB6, PB9, PC7, PC10, PC12, and PD4, USB uses PA9, PA11, and PA12, and
+the microphone uses PB10 and PC3. USART1 TX would land on PA9, and USART6
+shares PC7 with the audio clock, so the log uses USART2. The on-board ST-LINK
+has no virtual COM port; the adapter is a separate dongle.
 
 ![STM32F4 Discovery SPI2 wiring for the microSD reader and BME280](docs/stm32f4_spi_schematic.png)
 
@@ -51,7 +66,8 @@ src/sd_spi.ads/.adb         SD card over SPI (HAL.Block_Drivers.Block_Driver)
 src/bme280.ads/.adb         BME280 driver (temperature, pressure, humidity)
 src/read_bme280_id.adb      main: chip-id check
 src/demo_spi2.adb           main: sensor read and SD block round-trip
-src/weather_logger.adb      main: CSV log on the card every 10 s
+src/serial_log.ads/.adb     USART2 text log (115200 8N1, CR LF)
+src/weather_logger.adb      main: CSV log on the card and USART2 every 10 s
 docs/stm32f4_spi_schematic.png
 tools/draw.py
 lib/Ada_Drivers_Library/    git submodule
@@ -71,6 +87,9 @@ lib/Ada_Drivers_Library/    git submodule
   has no SPI-mode SD driver. The closest pieces are the SDIO controller in
   `STM32.SDMMC` / `HAL.SDMMC` and the `SDCard` board helper, which is wired
   for other boards.
+- `Serial_Log` brings up USART2 on PA2 (TX) and PA3 (RX) at 115200 8N1 and
+  provides `Put` and `Put_Line`. `Put_Line` appends CR LF. It uses
+  `STM32.USARTs` and `STM32.Device` (`USART_2`, `GPIO_AF_USART2_7`).
 - `BME280` is a standalone driver. Ada_Drivers_Library ships `BMP280` only,
   and that package does not implement humidity and only checks that the
   chip-id is non-zero. This driver requires chip-id `16#60#`, reads the
@@ -166,8 +185,9 @@ openocd -f board/stm32f4discovery.cfg \
 
 Use the same commands with `bin/demo_spi2` or `bin/read_bme280_id`.
 
-The board has no console unless you add a USART or semihosting yourself.
-The mains report through the user LEDs.
+`read_bme280_id` and `demo_spi2` report through the user LEDs.
+`weather_logger` also writes a text log on USART2. The Discovery ST-LINK
+has no virtual COM port.
 
 ## Mains and LEDs
 
@@ -194,7 +214,7 @@ CSD.
 ### `weather_logger`
 
 Mounts the card's FAT volume and, every 10 seconds, appends one BME280 sample
-to `/sd/WEATHER.CSV`. The header
+to `/sd/WEATHER.CSV` and prints the same sample on USART2. The CSV header
 
 ```text
 seconds,temp_c,pressure_pa,humidity_pct
@@ -204,8 +224,61 @@ is written only when the file is new (size 0). Temperature and humidity are
 written with two decimal places. Pressure is stored by the driver in hPa and
 converted to pascals for the `pressure_pa` column.
 
-- Green LED: a short blink after each successful write.
-- Red LED, solid: the card, the mount, or a write failed. Logging stops.
+#### Serial log
+
+USART2, 115200 baud, 8 data bits, no parity, 1 stop bit, no flow control.
+TX is PA2, RX is PA3, alternate function AF7. Each line ends with CR LF.
+
+At startup the firmware prints one header line naming the fields. Each sample
+then prints one colon-separated line. The first field is a sample number that
+starts at 1 and increases by one for every sample, including samples taken
+while the SD card is absent. The remaining fields are the CSV columns, in the
+same order and with the same formatting (elapsed seconds, temperature in °C
+with two decimal places, pressure in pascals, humidity in percent with two
+decimal places):
+
+```text
+sample:seconds:temp_c:pressure_pa:humidity_pct
+1:0:23.45:101325:48.20
+2:10:23.47:101318:48.31
+```
+
+`1:0:23.45:101325:48.20` is sample 1, zero seconds since the logging loop
+started, 23.45 °C, 101325 Pa (1013.25 hPa), 48.20 % relative humidity.
+
+If the card fails to initialize or the volume fails to mount, the firmware
+prints an error line and keeps sampling on the serial port instead of
+halting:
+
+```text
+error:sd_init_failed
+error:sd_mount_failed
+```
+
+A later failed append prints `error:sd_write_failed` and the next samples
+are still printed. A missing BME280 prints `error:bme280_init_failed` and
+then stops; there is nothing to log without the sensor.
+
+View the log from a 3.3 V USB-UART adapter (device name varies):
+
+```sh
+screen /dev/ttyUSB0 115200
+```
+
+```sh
+picocom -b 115200 /dev/ttyUSB0
+```
+
+Leave `screen` with `Ctrl-A` then `K`. Leave `picocom` with `Ctrl-A` then
+`Ctrl-X`.
+
+- Green LED: a short blink after each successful SD write.
+- Red LED, solid: the card failed to initialize, the volume failed to mount,
+  or a write failed. Serial samples continue. A successful later write turns
+  the red LED off.
+- Red LED, solid, program stopped: the BME280 did not answer, or an
+  unexpected exception was raised (`error:exception` on the serial port when
+  the USART is already up).
 
 `File_IO` has no append mode, and opening a file `Write_Only` truncates it.
 The logger opens `Read_Write` (which creates the file when it is missing),
@@ -225,7 +298,11 @@ The `embedded-stm32f4` runtime includes `Ada.Text_IO` and does not include
 - The card must already be formatted FAT12, FAT16, or FAT32, either with an
   MBR or as a superfloppy. The logger does not format a blank card.
 - The `seconds` column is time since boot (elapsed seconds from the start of
-  the logging loop), not wall-clock time.
+  the logging loop), not wall-clock time. The serial sample number starts
+  again at 1 on every reset.
+- The serial log uses the same hand-written integer formatting as the CSV.
+  Connect only a 3.3 V USB-UART adapter. The Discovery ST-LINK does not
+  provide a serial port.
 - `demo_spi2` temporarily overwrites the card's last block. It restores that
   block when the test finishes, and it does not write block 0. A power loss
   in the middle of the test can leave the last block overwritten.
