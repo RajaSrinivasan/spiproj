@@ -1,0 +1,7 @@
+obj/
+bin/
+*.elf
+*.bin
+*.hex
+alire/
+__pycache__/
