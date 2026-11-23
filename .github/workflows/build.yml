@@ -1,0 +1,109 @@
+name: build
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  GNAT_TAG: gnat-15.3.0-1
+  GNAT_ARCHIVE: gnat-arm-elf-linux64-x86_64-15.3.0-1.tar.gz
+  GNAT_SHA256: 163eb73f9eaa8ae3ac264c35b1a5edece640ede0060288e7d3ce78aeb4ffa826
+  GNAT_DIR: gnat-arm-elf-linux64-x86_64-15.3.0-1
+  GPR_TAG: gprbuild-25.0.0-1
+  GPR_ARCHIVE: gprbuild-x86_64-linux-25.0.0-1.tar.gz
+  GPR_SHA256: 9a2e6cfb9c4add85c7c411e95533c46728aae7de19a9a0b056abf53bd9795b0d
+  GPR_DIR: gprbuild-x86_64-linux-25.0.0-1
+
+jobs:
+  build:
+    name: ARM ELF
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Cache toolchain archives
+        id: toolchain-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/stm32f4-gnat
+          key: gnat-arm-elf-15.3.0-1-gprbuild-25.0.0-1-linux-x86_64
+
+      - name: Download GNAT ARM ELF and GPRbuild
+        if: steps.toolchain-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          dest="${HOME}/.cache/stm32f4-gnat"
+          mkdir -p "${dest}"
+          download() {
+            local url="$1" hash="$2" name="$3"
+            local tmp
+            tmp="$(mktemp)"
+            curl -fL --retry 5 --retry-delay 2 -o "${tmp}" "${url}"
+            echo "${hash}  ${tmp}" | sha256sum -c -
+            mv "${tmp}" "${dest}/${name}"
+          }
+          download \
+            "https://github.com/alire-project/GNAT-FSF-builds/releases/download/${GNAT_TAG}/${GNAT_ARCHIVE}" \
+            "${GNAT_SHA256}" "${GNAT_ARCHIVE}"
+          download \
+            "https://github.com/alire-project/GNAT-FSF-builds/releases/download/${GPR_TAG}/${GPR_ARCHIVE}" \
+            "${GPR_SHA256}" "${GPR_ARCHIVE}"
+
+      - name: Install toolchain
+        run: |
+          set -euo pipefail
+          src="${HOME}/.cache/stm32f4-gnat"
+          dest="${RUNNER_TEMP}/toolchain"
+          echo "${GNAT_SHA256}  ${src}/${GNAT_ARCHIVE}" | sha256sum -c -
+          echo "${GPR_SHA256}  ${src}/${GPR_ARCHIVE}" | sha256sum -c -
+          mkdir -p "${dest}"
+          tar -xzf "${src}/${GNAT_ARCHIVE}" -C "${dest}"
+          tar -xzf "${src}/${GPR_ARCHIVE}" -C "${dest}"
+          gnat_bin="${dest}/${GNAT_DIR}/bin"
+          gpr_bin="${dest}/${GPR_DIR}/bin"
+          test -x "${gnat_bin}/arm-eabi-gcc"
+          test -x "${gnat_bin}/arm-eabi-gnat"
+          test -x "${gnat_bin}/arm-eabi-objcopy"
+          test -x "${gpr_bin}/gprbuild"
+          # GITHUB_PATH is prepended, so the last line is first on PATH.
+          # The compiler's arm-eabi/bin (unprefixed binutils) stays off PATH.
+          echo "${gnat_bin}" >> "${GITHUB_PATH}"
+          echo "${gpr_bin}" >> "${GITHUB_PATH}"
+
+      - name: Build ARM ELF images
+        run: |
+          set -euo pipefail
+          command -v gprbuild
+          command -v arm-eabi-gcc
+          gprbuild --version
+          arm-eabi-gcc --version
+          gprbuild -P spiproj.gpr -j"$(nproc)"
+
+      - name: Package ELF and BIN images
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          for name in weather_logger demo_spi2 read_bme280_id; do
+            test -f "bin/${name}"
+            cp -f "bin/${name}" "artifacts/${name}.elf"
+            arm-eabi-objcopy -O binary "bin/${name}" "artifacts/${name}.bin"
+            arm-eabi-readelf -h "artifacts/${name}.elf" | grep -q 'Machine:[[:space:]]*ARM'
+          done
+          ls -l artifacts
+
+      - name: Upload images
+        uses: actions/upload-artifact@v4
+        with:
+          name: stm32f4-images
+          path: artifacts/
+          if-no-files-found: error

@@ -1,5 +1,7 @@
 # spiproj
 
+[![build](https://github.com/RajaSrinivasan/spiproj/actions/workflows/build.yml/badge.svg)](https://github.com/RajaSrinivasan/spiproj/actions/workflows/build.yml)
+
 Ada firmware for the STM32F4 Discovery board (STM32F407VG). A microSD card
 reader and a BME280 weather sensor share SPI2. The sources use AdaCore's
 [Ada_Drivers_Library](https://github.com/AdaCore/Ada_Drivers_Library) and the
@@ -119,6 +121,21 @@ gprbuild -P spiproj.gpr weather_logger.adb
 gprbuild -P spiproj.gpr demo_spi2.adb
 gprbuild -P spiproj.gpr read_bme280_id.adb
 ```
+
+## CI
+
+[`.github/workflows/build.yml`](.github/workflows/build.yml) builds
+`weather_logger`, `demo_spi2`, and `read_bme280_id` on every push, on pull
+requests, and when the workflow is dispatched by hand. The job downloads the
+GNAT FSF ARM ELF 15.3.0 toolchain and GPRbuild 25.0.0 from
+[GNAT-FSF-builds](https://github.com/alire-project/GNAT-FSF-builds/releases)
+(the same archives named above; the tarballs are cached between runs),
+checks out `lib/Ada_Drivers_Library` with its submodules, and runs
+`gprbuild -P spiproj.gpr`. The images are uploaded as the `stm32f4-images`
+artifact: `weather_logger.elf` and `.bin`, `demo_spi2.elf` and `.bin`, and
+`read_bme280_id.elf` and `.bin`. The `.elf` files are the extensionless
+`bin/` programs with a suffix added. The `.bin` files come from
+`arm-eabi-objcopy -O binary`.
 
 ## Flash
 
