@@ -1,8 +1,12 @@
 /* Bounds of the flash images checked by Flash_CRC.
-   Passed to ld along with the embedded-stm32f4 common-ROM.ld script.
-   ADDR, SIZEOF, and LOADADDR refer to the output sections that script
-   defines (.text, .rodata, and .data). __data_lma_* is the flash load
-   image of .data, not the RAM copy. */
+   Passed to ld along with ld/app_rom.ld or ld/boot_rom.ld.
+   ADDR, SIZEOF, and LOADADDR refer to the output sections those scripts
+   define (.text, .rodata, and .data). __data_lma_* is the flash load
+   image of .data, not the RAM copy.
+
+   For the application image the addresses sit in the upper window
+   (ld/layout_symbols.ld), not at 0x08000000. The bootloader occupies
+   the low window and is not part of this check. */
 
 __text_start     = ADDR(.text);
 __text_end       = ADDR(.text) + SIZEOF(.text);

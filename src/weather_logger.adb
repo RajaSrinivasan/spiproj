@@ -2,12 +2,9 @@
 --  Log BME280 readings to WEATHER.CSV on a FAT filesystem on the microSD
 --  card, once every 10 seconds.
 --
---  Mounting uses the library helpers: Filesystem.MBR.Read / Valid /
---  Get_Type / LBA to find the first FAT partition, then
---  Filesystem.FAT.Open at that LBA (or LBA 0 if there is no MBR, i.e. a
---  superfloppy card), then File_IO.Mount_Volume. File_IO.Mount_Drive does
---  a similar MBR walk but has no superfloppy fallback and only accepts
---  partition types 6 and 11 .. 12, so this main does the walk itself.
+--  Mounting is SD_Volume.Mount: the first FAT partition, or LBA 0 when
+--  the card has no MBR (a superfloppy), then File_IO.Mount_Volume. The
+--  bootloader uses the same walk so both programs see one volume.
 --
 --  File_IO has no append mode. Filesystem.FAT.Files.Open with Write_Only
 --  truncates the file (Set_Size to 0). This logger opens the file
@@ -36,13 +33,8 @@
 
 with Ada.Real_Time; use Ada.Real_Time;
 
-with HAL.Block_Drivers;
-with HAL.Filesystem; use type HAL.Filesystem.Status_Code;
-
-with File_IO;         use File_IO;
-with Filesystem;      use Filesystem;
+with File_IO; use File_IO;
 with Filesystem.FAT;
-with Filesystem.MBR;  use Filesystem.MBR;
 
 with HAL; use HAL;
 
@@ -51,6 +43,7 @@ with STM32.Board; use STM32.Board;
 with SPI_Bus;
 with BME280; use BME280;
 with SD_SPI; use SD_SPI;
+with SD_Volume;
 with Serial_Log;
 with Flash_CRC;
 
@@ -69,14 +62,6 @@ procedure Weather_Logger is
 
    procedure Fail with No_Return;
    --  Solid red LED, then wait forever.
-
-   function Is_FAT (T : Partition_Type) return Boolean;
-   --  FAT12/16/32 partition types from the Partitions package constants.
-
-   function Mount_Card
-     (Device : not null HAL.Block_Drivers.Any_Block_Driver;
-      FS     : in out Filesystem.FAT.FAT_Filesystem)
-      return Status_Code;
 
    procedure Append (Buf  : in out String;
                      Last : in out Natural;
@@ -143,65 +128,6 @@ procedure Weather_Logger is
          null;
       end loop;
    end Fail;
-
-   ------------
-   -- Is_FAT --
-   ------------
-
-   function Is_FAT (T : Partition_Type) return Boolean is
-   begin
-      --  Values match Partitions.Fat12_Parition, Fat16_Parition,
-      --  Fat16B_Parition, Fat32_CHS_Parition, Fat32_LBA_Parition,
-      --  Fat16B_LBA_Parition (note the library's "Parition" spelling).
-      return T in 16#01# | 16#04# | 16#06# | 16#0B# | 16#0C# | 16#0E#;
-   end Is_FAT;
-
-   ----------------
-   -- Mount_Card --
-   ----------------
-
-   function Mount_Card
-     (Device : not null HAL.Block_Drivers.Any_Block_Driver;
-      FS     : in out Filesystem.FAT.FAT_Filesystem)
-      return Status_Code
-   is
-      MBR     : Master_Boot_Record;
-      MBR_St  : Status_Code;
-      FAT_St  : HAL.Filesystem.Status_Code;
-      LBA     : Block_Number := 0;
-      Found   : Boolean := False;
-   begin
-      MBR_St := Read (Device, MBR);
-
-      if MBR_St = OK then
-         for P in Partition_Number'Range loop
-            if Valid (MBR, P) and then Is_FAT (Get_Type (MBR, P)) then
-               LBA := Filesystem.MBR.LBA (MBR, P);
-               Found := True;
-               exit;
-            end if;
-         end loop;
-
-         --  Valid MBR but no FAT entry: still try LBA 0 as a last resort.
-         if not Found then
-            LBA := 0;
-         end if;
-
-      elsif MBR_St = No_MBR_Found then
-         --  Superfloppy: the volume starts at the first block.
-         LBA := 0;
-
-      else
-         return MBR_St;
-      end if;
-
-      FAT_St := Filesystem.FAT.Open (Device, LBA, FS);
-      if FAT_St /= HAL.Filesystem.OK then
-         return No_Filesystem;
-      end if;
-
-      return Mount_Volume ("sd", FS'Unchecked_Access);
-   end Mount_Card;
 
    ------------
    -- Append --
@@ -539,7 +465,7 @@ begin
       Emit ("ERR", "sd_init_failed");
       Turn_On (Red_LED);
    else
-      Status := Mount_Card (Card'Unchecked_Access, FAT_FS);
+      Status := SD_Volume.Mount (Card'Unchecked_Access, FAT_FS);
       if Status /= OK then
          Emit ("ERR", "sd_mount_failed");
          Turn_On (Red_LED);
