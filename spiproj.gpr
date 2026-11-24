@@ -1,22 +1,15 @@
 --  STM32F4 Discovery (STM32F407VG) SPI2 project: microSD and BME280.
+--  The application images are linked in the upper flash window. The
+--  bootloader is the separate project bootloader.gpr.
 --
---  Ada_Drivers_Library is the git submodule at lib/Ada_Drivers_Library
---  (https://github.com/AdaCore/Ada_Drivers_Library). To use a checkout
---  somewhere else, change the with path below so it points at that tree's
---  boards/stm32f407_discovery/stm32f407_discovery_full.gpr.
+--  Ada_Drivers_Library is the git submodule at lib/Ada_Drivers_Library.
 --
---  Build every main:
+--  The runtime's default linker script pins flash at 0x08000000, so this
+--  build passes -XLOADER=USER and supplies ld/app_rom.ld:
 --
---    gprbuild -P spiproj.gpr
+--    gprbuild -P spiproj.gpr -XLOADER=USER
 --
---  Or one main:
---
---    gprbuild -P spiproj.gpr weather_logger.adb
---    gprbuild -P spiproj.gpr demo_spi2.adb
---    gprbuild -P spiproj.gpr read_bme280_id.adb
---
---  Requires the arm-eabi GNAT runtime "embedded-stm32f4", the runtime
---  this project selects from the library project.
+--  Requires the arm-eabi GNAT runtime "embedded-stm32f4".
 
 with "lib/Ada_Drivers_Library/boards/stm32f407_discovery/stm32f407_discovery_full.gpr";
 
@@ -25,18 +18,18 @@ project Spiproj is
    for Target use "arm-eabi";
    for Languages use ("Ada");
    for Source_Dirs use ("src");
-   for Object_Dir use "obj";
+   for Object_Dir use "obj/app";
    for Exec_Dir use "bin";
    for Create_Missing_Dirs use "True";
-   for Main use ("weather_logger.adb", "demo_spi2.adb", "read_bme280_id.adb");
+   for Main use
+     ("weather_logger.adb", "demo_spi2.adb", "read_bme280_id.adb");
 
    package Compiler renames STM32F407_Discovery_Full.Compiler;
 
    package Linker is
-      --  obj/ is the link cwd, so the script path is relative to that.
-      --  gprbuild puts this -T before the runtime's -T common-ROM.ld.
-      --  GNU ld still resolves ADDR, SIZEOF, and LOADADDR from that script.
       for Default_Switches ("Ada") use
-        ("-Wl,-T,../ld/section_symbols.ld");
+        ("-Wl,-T,../../ld/app_rom.ld",
+         "-Wl,-T,../../ld/section_symbols.ld",
+         "-Wl,--gc-sections");
    end Linker;
 end Spiproj;

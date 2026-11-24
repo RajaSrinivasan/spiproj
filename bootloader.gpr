@@ -1,0 +1,38 @@
+--  Small SD-card bootloader. This is a separate project from spiproj.gpr
+--  so it can use the light runtime (no tasking, no exception propagation)
+--  instead of the Ravenscar runtime the application needs.
+--
+--    gprbuild -P bootloader.gpr -XLOADER=USER
+--
+--  The image must fit in the boot window in ld/layout_symbols.ld.
+
+project Bootloader is
+   for Runtime ("Ada") use "light-stm32f4";
+   for Target use "arm-eabi";
+   for Languages use ("Ada");
+   for Source_Dirs use ("src/boot");
+   for Object_Dir use "obj/boot";
+   for Exec_Dir use "bin";
+   for Create_Missing_Dirs use "True";
+   for Main use ("bootloader.adb");
+
+   package Builder is
+      for Global_Configuration_Pragmas use "src/boot/restrictions.adc";
+   end Builder;
+
+   package Compiler is
+      for Default_Switches ("Ada") use
+        ("-Os",
+         "-gnatp",
+         "-ffunction-sections",
+         "-fdata-sections",
+         "-g");
+   end Compiler;
+
+   package Linker is
+      for Default_Switches ("Ada") use
+        ("-Wl,-T,../../ld/boot_rom.ld",
+         "-Wl,-T,../../ld/section_symbols.ld",
+         "-Wl,--gc-sections");
+   end Linker;
+end Bootloader;

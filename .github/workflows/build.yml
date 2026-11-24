@@ -87,19 +87,38 @@ jobs:
           command -v arm-eabi-gcc
           gprbuild --version
           arm-eabi-gcc --version
-          gprbuild -P spiproj.gpr -j"$(nproc)"
+          # LOADER=USER suppresses the runtime script that pins flash at
+          # 0x08000000. The application and the bootloader are linked
+          # separately so each gets its own window.
+          gprbuild -P spiproj.gpr -XLOADER=USER -j"$(nproc)"
+          gprbuild -P bootloader.gpr -XLOADER=USER -j"$(nproc)"
 
       - name: Package ELF and BIN images
         run: |
           set -euo pipefail
           mkdir -p artifacts
-          for name in weather_logger demo_spi2 read_bme280_id; do
+          for name in bootloader weather_logger demo_spi2 read_bme280_id; do
             test -f "bin/${name}"
             cp -f "bin/${name}" "artifacts/${name}.elf"
             arm-eabi-objcopy -O binary "bin/${name}" "artifacts/${name}.bin"
             arm-eabi-readelf -h "artifacts/${name}.elf" | grep -q 'Machine:[[:space:]]*ARM'
           done
           ls -l artifacts
+
+      - name: Check flash windows and pack bootstrap images
+        run: |
+          set -euo pipefail
+          python3 tools/bootstrap_image.py --self-test
+          python3 tools/bootstrap_image.py check-elf bin/bootloader boot
+          for name in weather_logger demo_spi2 read_bme280_id; do
+            python3 tools/bootstrap_image.py check-elf "bin/${name}" app
+            python3 tools/bootstrap_image.py pack \
+              "artifacts/${name}.bin" "artifacts/${name}.bootstrap"
+            python3 tools/bootstrap_image.py check "artifacts/${name}.bootstrap"
+          done
+          # The file name the card expects, for the weather logger image.
+          cp -f artifacts/weather_logger.bootstrap artifacts/bootstrap
+          python3 tools/bootstrap_image.py check artifacts/bootstrap
 
       - name: STM32 CRC-32 of the flash images
         run: |
